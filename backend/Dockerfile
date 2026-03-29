@@ -1,22 +1,27 @@
-# Usa un'immagine ufficiale di Node.js (leggera)
-FROM node:18-alpine
+# Dependency/Build Directories
+node_modules
+npm-debug.log
+.npm
 
-# Crea e imposta la cartella di lavoro nel container
-WORKDIR /usr/src/app
+# Project Files
+.git
+.gitignore
+.dockerignore
+Dockerfile
+fly.toml # Fly.io configuration file
 
-# Copia i file delle dipendenze e installale
-COPY package*.json ./
-RUN npm install
+# Environment/Configuration Files
+.env
+.DS_Store
+*.log
 
-# Copia tutto il resto del codice sorgente
-COPY . .
-
-# Crea la cartella per i dati persistenti (se non esiste)
-RUN mkdir -p /usr/src/app/data
-RUN mkdir -p /usr/src/app/sedi
-
-# Espone la porta che userà il server
-EXPOSE 3001
-
-# Comando per avviare il server
-CMD ["node", "server.js"]
+# Development/Testing files and directories (adjust as needed)
+test
+tests
+docs
+coverage
+tmp
+*~
+# Any files generated during development or testing, e.g.:
+dist
+build
