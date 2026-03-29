@@ -79,7 +79,7 @@ function App() {
       if (cityFilter) params.append('city', cityFilter)
       if (denominazioneFilter) params.append('denominazione', denominazioneFilter)
       
-      const response = await axios.get(`http://localhost:3001/api/sites?${params.toString()}`)
+      const response = await axios.get(`https://security-sud-sedi.onrender.com/api/sites?${params.toString()}`)
       setSites(response.data)
     } catch (error) {
       console.error("Errore nel caricamento dei siti", error)
@@ -89,7 +89,7 @@ function App() {
 
   const fetchFilterOptions = async () => {
     try {
-      const response = await axios.get('http://localhost:3001/api/filter-options')
+      const response = await axios.get('https://security-sud-sedi.onrender.com/api/filter-options')
       setFilterOptions(response.data)
     } catch (error) {
       console.error("Errore nel caricamento delle opzioni filtro", error)
@@ -178,7 +178,7 @@ function App() {
 
     setIsImporting(true)
     try {
-      await axios.post('http://localhost:3001/api/import', formData, {
+      await axios.post('https://security-sud-sedi.onrender.com/api/import', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       })
       alert("Importazione completata con successo!")
@@ -222,7 +222,7 @@ function App() {
 
     try {
       // Invia i dati al backend
-      await axios.put(`http://localhost:3001/api/sites/${newSiteData.site_code}`, newSiteData);
+      await axios.put(`https://security-sud-sedi.onrender.com/api/sites/${newSiteData.site_code}`, newSiteData);
       
       alert("Immobile aggiunto/aggiornato con successo!");
       setIsAddModalOpen(false);
@@ -829,7 +829,7 @@ function App() {
             saveBtn.disabled = true;
 
             try {
-              const response = await fetch('http://localhost:3001/api/sites/' + encodeURIComponent(siteCode), {
+              const response = await fetch('https://security-sud-sedi.onrender.com/api/sites/' + encodeURIComponent(siteCode), {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(siteData)
@@ -1035,7 +1035,7 @@ function App() {
                 onClick={async () => {
                   setIsImporting(true);
                   try {
-                    const response = await axios.post('http://localhost:3001/api/sync');
+                    const response = await axios.post('https://security-sud-sedi.onrender.com/api/sync');
                     alert("Sincronizzazione completata: " + response.data.message);
                     fetchSites();
                     fetchFilterOptions();
