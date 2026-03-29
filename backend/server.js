@@ -262,7 +262,14 @@ autoSyncOnStartup();
 
 
 // API: Import Excel Manuale (vecchio metodo)
-app.post('/api/import', upload.fields([
+app.post('/api/import', (req, res, next) => {
+  // Assicurati che la cartella uploads esista prima di usare multer
+  const dir = './uploads';
+  if (!fs.existsSync(dir)){
+      fs.mkdirSync(dir);
+  }
+  next();
+}, upload.fields([
   { name: 'fileImmobili', maxCount: 1 },
   { name: 'fileClassPoint', maxCount: 1 }
 ]), async (req, res) => {
