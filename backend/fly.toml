@@ -1,0 +1,22 @@
+app = "backend-sedi"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "3001"
+  DATA_DIR = "/app/data"
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[mounts]
+  source = "sedi_data"
+  destination = "/app/data"
+  initial_size = "1gb"
