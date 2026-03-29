@@ -55,124 +55,115 @@ const parseFile = (filePath, originalName) => {
 };
 
 // Funzione centrale per importare i dati dai file
-const processImport = (immobiliData, classPointData) => {
-  return new Promise((resolve, reject) => {
-    const unifiedMap = new Map();
+const processImport = async (immobiliData, classPointData) => {
+  const unifiedMap = new Map();
 
-    if (immobiliData) {
-      immobiliData.forEach(item => {
-        const pk = item['CodiceImmobile'];
-        if (pk) {
-          unifiedMap.set(String(pk).trim(), {
-            site_code: String(pk).trim(),
-            data_immobili: item,
-            data_class_point: null
+  if (immobiliData) {
+    immobiliData.forEach(item => {
+      const pk = item['CodiceImmobile'];
+      if (pk) {
+        unifiedMap.set(String(pk).trim(), {
+          site_code: String(pk).trim(),
+          data_immobili: item,
+          data_class_point: null
+        });
+      }
+    });
+  }
+
+  if (classPointData) {
+    classPointData.forEach(item => {
+      const pk = item['SAP Code'];
+      if (pk) {
+        const key = String(pk).trim();
+        if (unifiedMap.has(key)) {
+          unifiedMap.get(key).data_class_point = item;
+        } else {
+          unifiedMap.set(key, {
+            site_code: key,
+            data_immobili: null,
+            data_class_point: item
           });
         }
-      });
+      }
+    });
+  }
+
+  try {
+    // Svuotiamo la tabella prima di re-inserire i dati massivi
+    await db.run("DELETE FROM sites");
+
+    // In SQLite possiamo usare le transazioni per velocizzare, in Postgres non è strettamente necessario ma male non fa
+    if (!db.isPostgres) {
+      await db.run("BEGIN TRANSACTION");
     }
 
-    if (classPointData) {
-      classPointData.forEach(item => {
-        const pk = item['SAP Code'];
-        if (pk) {
-          const key = String(pk).trim();
-          if (unifiedMap.has(key)) {
-            unifiedMap.get(key).data_class_point = item;
-          } else {
-            unifiedMap.set(key, {
-              site_code: key,
-              data_immobili: null,
-              data_class_point: item
-            });
-          }
-        }
-      });
-    }
+    const records = Array.from(unifiedMap.values());
+    let errorOccurred = false;
 
-    db.serialize(() => {
-      // 1. Svuotiamo la tabella prima di re-inserire i dati massivi
-      // Questo garantisce che se hai cancellato righe dai CSV, non rimangano "orfane" nel DB
-      db.run("DELETE FROM sites", (err) => {
-        if (err) {
-          console.error("Errore durante la pulizia del DB:", err);
-          return reject(err);
-        }
-        
-        db.run("BEGIN TRANSACTION");
-        const insertStmt = db.prepare(`
+    // Inserimento sequenziale asincrono
+    for (const record of records) {
+      const imm = record.data_immobili || {};
+      const cp = record.data_class_point || {};
+      const merged = { ...imm, ...cp };
+      
+      const region = imm['Regione'] || cp['Region'] || '';
+      const province = imm['Provincia'] || cp['Province'] || '';
+      const city = imm['Comune'] || cp['City'] || '';
+      const status = imm['StatoImmobile'] || cp['Stato SDF'] || '';
+      
+      const rawLat = imm['Latitudine'] || imm['latitudine'] || imm['LATITUDINE'];
+      const rawLng = imm['Longitudine'] || imm['longitudine'] || imm['LONGITUDINE'];
+
+      const lat = parseFloatSafe(rawLat);
+      const lng = parseFloatSafe(rawLng);
+
+      try {
+        await db.run(`
           INSERT INTO sites (site_code, region, province, city, status, latitude, longitude, data_immobili, data_class_point, merged_data)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
+        `, [
+          record.site_code,
+          region,
+          province,
+          city,
+          status,
+          lat,
+          lng,
+          JSON.stringify(imm),
+          JSON.stringify(cp),
+          JSON.stringify(merged)
+        ]);
+      } catch (err) {
+        console.error("Errore inserimento riga:", err);
+        errorOccurred = true;
+        break;
+      }
+    }
 
-        // Convertiamo la mappa in array per processarla in modo sequenziale
-        const records = Array.from(unifiedMap.values());
-        
-        const insertSequential = (index) => {
-          if (index >= records.length) {
-            insertStmt.finalize();
-            db.run("COMMIT", (err) => {
-              if (err) {
-                console.error(err);
-                reject(err);
-              } else {
-                resolve(records.length);
-              }
-            });
-            return;
-          }
+    if (!db.isPostgres) {
+      if (errorOccurred) {
+        await db.run("ROLLBACK");
+        throw new Error("Errore durante l'inserimento dei record");
+      } else {
+        await db.run("COMMIT");
+      }
+    } else if (errorOccurred) {
+        throw new Error("Errore durante l'inserimento dei record in Postgres");
+    }
 
-          const record = records[index];
-          const imm = record.data_immobili || {};
-          const cp = record.data_class_point || {};
-          const merged = { ...imm, ...cp };
-          
-          const region = imm['Regione'] || cp['Region'] || '';
-          const province = imm['Provincia'] || cp['Province'] || '';
-          const city = imm['Comune'] || cp['City'] || '';
-          const status = imm['StatoImmobile'] || cp['Stato SDF'] || '';
-          
-          const rawLat = imm['Latitudine'] || imm['latitudine'] || imm['LATITUDINE'];
-          const rawLng = imm['Longitudine'] || imm['longitudine'] || imm['LONGITUDINE'];
-
-          const lat = parseFloatSafe(rawLat);
-          const lng = parseFloatSafe(rawLng);
-
-          insertStmt.run([
-            record.site_code,
-            region,
-            province,
-            city,
-            status,
-            lat,
-            lng,
-            JSON.stringify(imm),
-            JSON.stringify(cp),
-            JSON.stringify(merged)
-          ], (err) => {
-            if (err) {
-              console.error("Errore inserimento riga:", err);
-              insertStmt.finalize();
-              db.run("ROLLBACK");
-              return reject(err);
-            }
-            // Chiamata ricorsiva al prossimo elemento per garantire sequenzialità assoluta
-            // Usa setImmediate o process.nextTick per non saturare il call stack
-            setImmediate(() => insertSequential(index + 1));
-          });
-        };
-
-        // Inizia l'inserimento sequenziale dal primo record
-        insertSequential(0);
-      });
-    });
-  });
+    return records.length;
+  } catch (err) {
+    console.error("Errore durante il processImport:", err);
+    throw err;
+  }
 };
 
 // API: Auto-Sync endpoint (Cerca file specifici nella cartella predefinita)
 app.post('/api/sync', async (req, res) => {
   try {
-    const defaultDir = 'c:\\Users\\Utente\\OneDrive\\Desktop\\sedi';
+    // Se stiamo girando su Render (NODE_ENV=production) cerca nella cartella corrente, altrimenti usa il percorso locale
+    const defaultDir = process.env.NODE_ENV === 'production' ? __dirname : (process.env.DATA_DIR || 'c:\\Users\\Utente\\OneDrive\\Desktop\\sedi');
     
     // Proviamo diverse varianti di nome per essere più flessibili
     const possibleImmobiliNames = ['immobili.csv', 'Immobili.csv', 'immobili.xlsx', 'Immobili.xlsx'];
@@ -230,7 +221,8 @@ app.post('/api/sync', async (req, res) => {
 // Esegui la sincronizzazione automatica all'avvio del server
 const autoSyncOnStartup = async () => {
   console.log("Esecuzione sincronizzazione automatica dei CSV all'avvio...");
-  const defaultDir = 'c:\\Users\\Utente\\OneDrive\\Desktop\\sedi';
+  // Se stiamo girando su Render (NODE_ENV=production) cerca nella cartella corrente, altrimenti usa il percorso locale
+  const defaultDir = process.env.NODE_ENV === 'production' ? __dirname : (process.env.DATA_DIR || 'c:\\Users\\Utente\\OneDrive\\Desktop\\sedi');
   
   const possibleImmobiliNames = ['immobili.csv', 'Immobili.csv', 'immobili.xlsx', 'Immobili.xlsx'];
   const possibleClassPointNames = ['class_point.csv', 'Class Point.csv', 'Class Point SUD.csv', 'class point.csv'];
@@ -335,14 +327,13 @@ app.post('/api/import', upload.fields([
 });
 
 // API: Get all sites (with search/filter)
-app.get('/api/sites', (req, res) => {
+app.get('/api/sites', async (req, res) => {
   const { search, region, province, city, denominazione } = req.query;
   
   let query = 'SELECT site_code, region, province, city, status, latitude, longitude, merged_data FROM sites WHERE 1=1';
   const params = [];
 
   if (region) {
-    // case insensitive search for SQLite
     query += ' AND LOWER(region) = LOWER(?)';
     params.push(region);
   }
@@ -366,16 +357,16 @@ app.get('/api/sites', (req, res) => {
   // Add limit for performance on large datasets
   query += ' LIMIT 1000';
 
-  db.all(query, params, (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
+  try {
+    const rows = await db.query(query, params);
     const formattedRows = rows.map(r => ({
       ...r,
-      merged_data: JSON.parse(r.merged_data)
+      merged_data: typeof r.merged_data === 'string' ? JSON.parse(r.merged_data) : r.merged_data
     }));
     res.json(formattedRows);
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Helper to format string to Title Case (e.g. "CAMPANIA" -> "Campania")
@@ -387,10 +378,9 @@ const toTitleCase = (str) => {
 };
 
 // API: Get filter options for cascading dropdowns
-app.get('/api/filter-options', (req, res) => {
-  db.all('SELECT region, province, city, merged_data FROM sites', [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    
+app.get('/api/filter-options', async (req, res) => {
+  try {
+    const rows = await db.query('SELECT region, province, city, merged_data FROM sites');
     const options = rows.map(r => {
       let denominazione = '';
       let region = r.region;
@@ -398,7 +388,7 @@ app.get('/api/filter-options', (req, res) => {
       let city = r.city;
 
       try {
-        const data = JSON.parse(r.merged_data || '{}');
+        const data = typeof r.merged_data === 'string' ? JSON.parse(r.merged_data || '{}') : r.merged_data;
         denominazione = data.Denominazione || data.Nome || data.Descrizione || '';
         
         // Fallback for region/province/city if they are empty in the root columns
@@ -416,24 +406,29 @@ app.get('/api/filter-options', (req, res) => {
     });
     
     res.json(options);
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // API: Get single site
-app.get('/api/sites/:site_code', (req, res) => {
-  db.get('SELECT * FROM sites WHERE site_code = ?', [req.params.site_code], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ error: 'Sito non trovato' });
+app.get('/api/sites/:site_code', async (req, res) => {
+  try {
+    const rows = await db.query('SELECT * FROM sites WHERE site_code = ?', [req.params.site_code]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Sito non trovato' });
     
-    row.data_immobili = JSON.parse(row.data_immobili);
-    row.data_class_point = JSON.parse(row.data_class_point);
-    row.merged_data = JSON.parse(row.merged_data);
+    const row = rows[0];
+    row.data_immobili = typeof row.data_immobili === 'string' ? JSON.parse(row.data_immobili) : row.data_immobili;
+    row.data_class_point = typeof row.data_class_point === 'string' ? JSON.parse(row.data_class_point) : row.data_class_point;
+    row.merged_data = typeof row.merged_data === 'string' ? JSON.parse(row.merged_data) : row.merged_data;
     res.json(row);
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // API: Create new site
-app.post('/api/sites', (req, res) => {
+app.post('/api/sites', async (req, res) => {
   const data = req.body;
   const site_code = data.site_code || data['CodiceImmobile'] || data['SAP Code'];
   
@@ -448,20 +443,22 @@ app.post('/api/sites', (req, res) => {
   const lat = parseFloatSafe(data['Latitudine']);
   const lng = parseFloatSafe(data['Longitudine']);
 
-  db.run(`
-    INSERT INTO sites (site_code, region, province, city, status, latitude, longitude, data_immobili, data_class_point, merged_data)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `, [
-    site_code, region, province, city, status, lat, lng, 
-    JSON.stringify(data), '{}', JSON.stringify(data)
-  ], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
+  try {
+    await db.run(`
+      INSERT INTO sites (site_code, region, province, city, status, latitude, longitude, data_immobili, data_class_point, merged_data)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      site_code, region, province, city, status, lat, lng, 
+      JSON.stringify(data), '{}', JSON.stringify(data)
+    ]);
     res.status(201).json({ message: 'Sito creato', site_code });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // API: Update or Insert site (Upsert)
-app.put('/api/sites/:site_code', (req, res) => {
+app.put('/api/sites/:site_code', async (req, res) => {
   const data = req.body;
   const site_code = req.params.site_code;
   
@@ -472,61 +469,60 @@ app.put('/api/sites/:site_code', (req, res) => {
   const lat = parseFloatSafe(data['Latitudine']);
   const lng = parseFloatSafe(data['Longitudine']);
 
-  // Prima controlliamo se esiste
-  db.get('SELECT * FROM sites WHERE site_code = ?', [site_code], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
+  try {
+    // Prima controlliamo se esiste
+    const rows = await db.query('SELECT * FROM sites WHERE site_code = ?', [site_code]);
     
-    if (row) {
+    if (rows.length > 0) {
+      const row = rows[0];
       // Aggiornamento (merge dei dati esistenti con i nuovi)
-      const existingMergedData = JSON.parse(row.merged_data || '{}');
+      const existingMergedData = typeof row.merged_data === 'string' ? JSON.parse(row.merged_data || '{}') : row.merged_data;
       const newMergedData = { ...existingMergedData, ...data };
       
-      db.run(`
+      await db.run(`
         UPDATE sites 
         SET region=?, province=?, city=?, status=?, latitude=?, longitude=?, merged_data=?
         WHERE site_code=?
       `, [
         region, province, city, status, lat, lng, JSON.stringify(newMergedData), site_code
-      ], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: 'Sito aggiornato' });
-      });
+      ]);
+      res.json({ message: 'Sito aggiornato' });
     } else {
       // Inserimento nuovo
-      db.run(`
+      await db.run(`
         INSERT INTO sites (site_code, region, province, city, status, latitude, longitude, data_immobili, data_class_point, merged_data)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         site_code, region, province, city, status, lat, lng, 
         JSON.stringify(data), '{}', JSON.stringify(data)
-      ], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.status(201).json({ message: 'Sito creato', site_code });
-      });
+      ]);
+      res.status(201).json({ message: 'Sito creato', site_code });
     }
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // API: Delete site
-app.delete('/api/sites/:site_code', (req, res) => {
-  db.run('DELETE FROM sites WHERE site_code=?', [req.params.site_code], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
+app.delete('/api/sites/:site_code', async (req, res) => {
+  try {
+    await db.run('DELETE FROM sites WHERE site_code=?', [req.params.site_code]);
     res.json({ message: 'Sito eliminato' });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // API: Dashboard stats
-app.get('/api/stats', (req, res) => {
-  const stats = {};
-  
-  db.all('SELECT region, COUNT(*) as count FROM sites GROUP BY region', [], (err, rows) => {
-    if (!err) stats.regions = rows;
-    
-    db.all('SELECT status, COUNT(*) as count FROM sites GROUP BY status', [], (err2, rows2) => {
-      if (!err2) stats.status = rows2;
-      res.json(stats);
-    });
-  });
+app.get('/api/stats', async (req, res) => {
+  try {
+    const stats = {};
+    stats.regions = await db.query('SELECT region, COUNT(*) as count FROM sites GROUP BY region');
+    stats.status = await db.query('SELECT status, COUNT(*) as count FROM sites GROUP BY status');
+    res.json(stats);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.listen(PORT, () => {
