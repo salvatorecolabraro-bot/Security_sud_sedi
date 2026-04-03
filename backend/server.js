@@ -55,161 +55,125 @@ const parseFile = (filePath, originalName) => {
 };
 
 // Funzione centrale per importare i dati dai file
-const processImport = async (immobiliData, classPointData) => {
-  const unifiedMap = new Map();
-
-  if (immobiliData) {
-    immobiliData.forEach(item => {
-      const pk = item['CodiceImmobile'];
-      if (pk) {
-        unifiedMap.set(String(pk).trim(), {
-          site_code: String(pk).trim(),
-          data_immobili: item,
-          data_class_point: null
-        });
-      }
-    });
-  }
-
-  if (classPointData) {
-    classPointData.forEach(item => {
-      const pk = item['SAP Code'];
-      if (pk) {
-        const key = String(pk).trim();
-        if (unifiedMap.has(key)) {
-          unifiedMap.get(key).data_class_point = item;
-        } else {
-          unifiedMap.set(key, {
-            site_code: key,
-            data_immobili: null,
-            data_class_point: item
-          });
+const processImport = (data) => {
+  return new Promise((resolve, reject) => {
+    db.serialize(() => {
+      // 1. Svuotiamo la tabella prima di re-inserire i dati massivi
+      db.run("DELETE FROM sites", (err) => {
+        if (err) {
+          console.error("Errore durante la pulizia del DB:", err);
+          return reject(err);
         }
-      }
-    });
-  }
-
-  try {
-    // Svuotiamo la tabella prima di re-inserire i dati massivi
-    await db.run("DELETE FROM sites");
-
-    // In SQLite possiamo usare le transazioni per velocizzare, in Postgres non è strettamente necessario ma male non fa
-    if (!db.isPostgres) {
-      await db.run("BEGIN TRANSACTION");
-    }
-
-    const records = Array.from(unifiedMap.values());
-    let errorOccurred = false;
-
-    // Inserimento sequenziale asincrono
-    for (const record of records) {
-      const imm = record.data_immobili || {};
-      const cp = record.data_class_point || {};
-      const merged = { ...imm, ...cp };
-      
-      const region = imm['Regione'] || cp['Region'] || '';
-      const province = imm['Provincia'] || cp['Province'] || '';
-      const city = imm['Comune'] || cp['City'] || '';
-      const status = imm['StatoImmobile'] || cp['Stato SDF'] || '';
-      
-      const rawLat = imm['Latitudine'] || imm['latitudine'] || imm['LATITUDINE'];
-      const rawLng = imm['Longitudine'] || imm['longitudine'] || imm['LONGITUDINE'];
-
-      const lat = parseFloatSafe(rawLat);
-      const lng = parseFloatSafe(rawLng);
-
-      try {
-        await db.run(`
-          INSERT INTO sites (site_code, region, province, city, status, latitude, longitude, data_immobili, data_class_point, merged_data)
+        
+        db.run("BEGIN TRANSACTION");
+        const insertStmt = db.prepare(`
+          INSERT OR REPLACE INTO sites (site_code, region, province, city, status, latitude, longitude, data_immobili, data_class_point, merged_data)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-          record.site_code,
-          region,
-          province,
-          city,
-          status,
-          lat,
-          lng,
-          JSON.stringify(imm),
-          JSON.stringify(cp),
-          JSON.stringify(merged)
-        ]);
-      } catch (err) {
-        console.error("Errore inserimento riga:", err);
-        errorOccurred = true;
-        break;
-      }
-    }
+        `);
 
-    if (!db.isPostgres) {
-      if (errorOccurred) {
-        await db.run("ROLLBACK");
-        throw new Error("Errore durante l'inserimento dei record");
-      } else {
-        await db.run("COMMIT");
-      }
-    } else if (errorOccurred) {
-        throw new Error("Errore durante l'inserimento dei record in Postgres");
-    }
+        const records = data;
+        
+        const insertSequential = (index) => {
+          if (index >= records.length) {
+            insertStmt.finalize();
+            db.run("COMMIT", (err) => {
+              if (err) {
+                console.error(err);
+                reject(err);
+              } else {
+                resolve(records.length);
+              }
+            });
+            return;
+          }
 
-    return records.length;
-  } catch (err) {
-    console.error("Errore durante il processImport:", err);
-    throw err;
-  }
+          const record = records[index];
+          
+          // Estrapoliamo i campi. I nomi delle colonne potrebbero variare, cerchiamo i più comuni.
+          const siteCode = String(record['SAP Code'] || record['CodiceImmobile'] || record['Site Code'] || index).trim();
+          const region = record['Region'] || record['Regione'] || '';
+          const province = record['Province'] || record['Provincia'] || '';
+          const city = record['City'] || record['Comune'] || '';
+          const status = record['Stato SDF'] || record['StatoImmobile'] || record['Status'] || '';
+          const denominazione = record['Denominazione'] || record['Nome'] || record['Descrizione'] || '';
+          
+          const rawLat = record['Latitudine'] || record['latitudine'] || record['LATITUDINE'] || record['Lat'] || record['lat'];
+          const rawLng = record['Longitudine'] || record['longitudine'] || record['LONGITUDINE'] || record['Lng'] || record['lng'] || record['Lon'] || record['lon'];
+
+          const lat = parseFloatSafe(rawLat);
+          const lng = parseFloatSafe(rawLng);
+
+          // Poiché abbiamo un solo file, mettiamo tutto in merged_data
+          // data_immobili e data_class_point possono contenere lo stesso record o essere nulli
+          const stringifiedRecord = JSON.stringify(record);
+
+          insertStmt.run([
+            siteCode,
+            region,
+            province,
+            city,
+            status,
+            lat,
+            lng,
+            stringifiedRecord, // Manteniamo la retrocompatibilità
+            stringifiedRecord,
+            stringifiedRecord
+          ], (err) => {
+            if (err) {
+              console.error("Errore inserimento riga:", err);
+              insertStmt.finalize();
+              db.run("ROLLBACK");
+              return reject(err);
+            }
+            setImmediate(() => insertSequential(index + 1));
+          });
+        };
+
+        insertSequential(0);
+      });
+    });
+  });
 };
 
 // API: Auto-Sync endpoint (Cerca file specifici nella cartella predefinita)
 app.post('/api/sync', async (req, res) => {
   try {
-    // Se stiamo girando su Render (NODE_ENV=production) cerca nella cartella corrente, altrimenti usa il percorso locale
-    const defaultDir = process.env.NODE_ENV === 'production' ? __dirname : (process.env.DATA_DIR || 'c:\\Users\\Utente\\OneDrive\\Desktop\\sedi');
+    const defaultDir = 'c:\\Users\\Utente\\OneDrive\\Desktop\\sedi';
     
-    // Proviamo diverse varianti di nome per essere più flessibili
-    const possibleImmobiliNames = ['immobili.csv', 'Immobili.csv', 'immobili.xlsx', 'Immobili.xlsx'];
-    const possibleClassPointNames = ['class_point.csv', 'Class Point.csv', 'Class Point SUD.csv', 'class point.csv'];
+    // Cerchiamo il nuovo file unificato
+    const possibleNames = ['ClassPointSUD_con_coordinate.csv', 'ClassPointSUD_con_coordinate.xlsx', 'classpoint.csv', 'classpoint.xlsx'];
     
-    let immobiliPath = null;
-    let classPointPath = null;
+    let filePath = null;
 
-    // Cerca il file immobili
-    for (const name of possibleImmobiliNames) {
+    // Cerca il file
+    for (const name of possibleNames) {
       const p = path.join(defaultDir, name);
       if (fs.existsSync(p)) {
-        immobiliPath = p;
+        filePath = p;
         break;
       }
     }
 
-    // Cerca il file class point
-    for (const name of possibleClassPointNames) {
-      const p = path.join(defaultDir, name);
-      if (fs.existsSync(p)) {
-        classPointPath = p;
-        break;
+    if (!filePath) {
+      // Prova a cercarlo nella root del progetto
+      const rootDir = path.resolve(__dirname, '..');
+      for (const name of possibleNames) {
+        const p = path.join(rootDir, name);
+        if (fs.existsSync(p)) {
+          filePath = p;
+          break;
+        }
       }
     }
 
-    let immobiliData = [];
-    let classPointData = [];
-    let filesFound = 0;
-
-    if (immobiliPath) {
-      console.log(`Trovato file immobili: ${immobiliPath}`);
-      immobiliData = parseFile(immobiliPath, path.basename(immobiliPath));
-      filesFound++;
-    }
-    if (classPointPath) {
-      console.log(`Trovato file class point: ${classPointPath}`);
-      classPointData = parseFile(classPointPath, path.basename(classPointPath));
-      filesFound++;
+    if (!filePath) {
+      return res.status(404).json({ error: 'Nessun file ClassPointSUD_con_coordinate trovato.' });
     }
 
-    if (filesFound === 0) {
-      return res.status(404).json({ error: 'Nessun file immobili o class point trovato nella directory specificata.' });
-    }
+    console.log(`Trovato file unificato: ${filePath}`);
+    const parsedData = parseFile(filePath, path.basename(filePath));
 
-    const count = await processImport(immobiliData, classPointData);
+    const count = await processImport(parsedData);
     res.json({ message: 'Sincronizzazione automatica completata con successo', count: count });
 
   } catch (error) {
@@ -221,37 +185,39 @@ app.post('/api/sync', async (req, res) => {
 // Esegui la sincronizzazione automatica all'avvio del server
 const autoSyncOnStartup = async () => {
   console.log("Esecuzione sincronizzazione automatica dei CSV all'avvio...");
-  // Se stiamo girando su Render (NODE_ENV=production) cerca nella cartella corrente, altrimenti usa il percorso locale
-  const defaultDir = process.env.NODE_ENV === 'production' ? __dirname : (process.env.DATA_DIR || 'c:\\Users\\Utente\\OneDrive\\Desktop\\sedi');
+  const defaultDir = 'c:\\Users\\Utente\\OneDrive\\Desktop\\sedi';
   
-  const possibleImmobiliNames = ['immobili.csv', 'Immobili.csv', 'immobili.xlsx', 'Immobili.xlsx'];
-  const possibleClassPointNames = ['class_point.csv', 'Class Point.csv', 'Class Point SUD.csv', 'class point.csv'];
+  const possibleNames = ['ClassPointSUD_con_coordinate.csv', 'ClassPointSUD_con_coordinate.xlsx', 'classpoint.csv', 'classpoint.xlsx'];
   
-  let immobiliPath = null;
-  let classPointPath = null;
+  let filePath = null;
 
-  for (const name of possibleImmobiliNames) {
+  for (const name of possibleNames) {
     const p = path.join(defaultDir, name);
-    if (fs.existsSync(p)) { immobiliPath = p; break; }
+    if (fs.existsSync(p)) { filePath = p; break; }
   }
 
-  for (const name of possibleClassPointNames) {
-    const p = path.join(defaultDir, name);
-    if (fs.existsSync(p)) { classPointPath = p; break; }
+  if (!filePath) {
+    const rootDir = path.resolve(__dirname, '..');
+    for (const name of possibleNames) {
+      const p = path.join(rootDir, name);
+      if (fs.existsSync(p)) {
+        filePath = p;
+        break;
+      }
+    }
   }
-
-  let immobiliData = [];
-  let classPointData = [];
 
   try {
-    if (immobiliPath) immobiliData = parseFile(immobiliPath, path.basename(immobiliPath));
-    if (classPointPath) classPointData = parseFile(classPointPath, path.basename(classPointPath));
-    
-    if (immobiliData.length > 0 || classPointData.length > 0) {
-      const count = await processImport(immobiliData, classPointData);
-      console.log(`Auto-sync completato. Caricati/Aggiornati ${count} record dal disco.`);
+    if (filePath) {
+      const parsedData = parseFile(filePath, path.basename(filePath));
+      if (parsedData.length > 0) {
+        const count = await processImport(parsedData);
+        console.log(`Auto-sync completato. Caricati/Aggiornati ${count} record dal disco.`);
+      } else {
+        console.log("Il file è vuoto.");
+      }
     } else {
-      console.log("Nessun file CSV trovato per la sincronizzazione iniziale in " + defaultDir);
+      console.log("Nessun file unificato trovato per la sincronizzazione iniziale.");
     }
   } catch (e) {
     console.error("Errore durante l'auto-sync all'avvio:", e);
@@ -261,34 +227,21 @@ const autoSyncOnStartup = async () => {
 autoSyncOnStartup();
 
 
-// API: Import Excel Manuale (vecchio metodo)
-app.post('/api/import', (req, res, next) => {
-  // Assicurati che la cartella uploads esista prima di usare multer
-  const dir = './uploads';
-  if (!fs.existsSync(dir)){
-      fs.mkdirSync(dir);
-  }
-  next();
-}, upload.fields([
-  { name: 'fileImmobili', maxCount: 1 },
-  { name: 'fileClassPoint', maxCount: 1 }
-]), async (req, res) => {
+// API: Import Excel Manuale
+app.post('/api/import', upload.single('file'), async (req, res) => {
   try {
-    const files = req.files;
-    if (!files || (!files.fileImmobili && !files.fileClassPoint)) {
+    const file = req.file;
+    if (!file) {
       return res.status(400).json({ error: 'Nessun file caricato' });
     }
 
-    let immobiliData = [];
-    let classPointData = [];
+    let parsedData = [];
 
     // Helper to parse file
     const parseFileLocal = (fileObj) => {
       const isCsv = fileObj.originalname.toLowerCase().endsWith('.csv');
       if (isCsv) {
         const content = fs.readFileSync(fileObj.path, 'utf8');
-        // PapaParse automatically detects standard separators including ';'
-        // transformHeader: (h) => h.trim() removes leading/trailing spaces from column names!
         return Papa.parse(content, { 
           header: true, 
           skipEmptyLines: true, 
@@ -302,8 +255,6 @@ app.post('/api/import', (req, res, next) => {
         const sheetName = workbook.SheetNames[0];
         const sheet = workbook.Sheets[sheetName];
         const rawData = xlsx.utils.sheet_to_json(sheet);
-        
-        // Applica il trim sulle chiavi anche per i file Excel per sicurezza
         return rawData.map(row => {
           const cleanRow = {};
           for (const key in row) {
@@ -316,31 +267,30 @@ app.post('/api/import', (req, res, next) => {
       }
     };
 
-    if (files.fileImmobili) {
-      immobiliData = parseFileLocal(files.fileImmobili[0]);
-    }
+    parsedData = parseFileLocal(file);
 
-    if (files.fileClassPoint) {
-      classPointData = parseFileLocal(files.fileClassPoint[0]);
-    }
+    const count = await processImport(parsedData);
+    
+    // Cleanup dei file temporanei
+    fs.unlinkSync(file.path);
 
-    const count = await processImport(immobiliData, classPointData);
-    res.json({ message: 'Importazione completata con successo', count: count });
+    res.json({ message: 'Dati importati con successo', count: count });
 
   } catch (error) {
-    console.error("Errore importazione manuale:", error);
-    res.status(500).json({ error: error.message || 'Errore durante l\'importazione' });
+    console.error("Errore durante l'importazione:", error);
+    res.status(500).json({ error: 'Errore durante l\'importazione: ' + error.message });
   }
 });
 
 // API: Get all sites (with search/filter)
-app.get('/api/sites', async (req, res) => {
+app.get('/api/sites', (req, res) => {
   const { search, region, province, city, denominazione } = req.query;
   
   let query = 'SELECT site_code, region, province, city, status, latitude, longitude, merged_data FROM sites WHERE 1=1';
   const params = [];
 
   if (region) {
+    // case insensitive search for SQLite
     query += ' AND LOWER(region) = LOWER(?)';
     params.push(region);
   }
@@ -361,19 +311,19 @@ app.get('/api/sites', async (req, res) => {
     params.push(`%${search}%`, `%${search}%`);
   }
 
-  // Add limit for performance on large datasets
-  query += ' LIMIT 1000';
+  // Remove hard limit of 1000 to allow statistics to calculate over all dataset
+  // query += ' LIMIT 1000';
 
-  try {
-    const rows = await db.query(query, params);
+  db.all(query, params, (err, rows) => {
+    if (err) {
+      return res.status(500).json({ error: err.message });
+    }
     const formattedRows = rows.map(r => ({
       ...r,
-      merged_data: typeof r.merged_data === 'string' ? JSON.parse(r.merged_data) : r.merged_data
+      merged_data: JSON.parse(r.merged_data)
     }));
     res.json(formattedRows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  });
 });
 
 // Helper to format string to Title Case (e.g. "CAMPANIA" -> "Campania")
@@ -385,9 +335,10 @@ const toTitleCase = (str) => {
 };
 
 // API: Get filter options for cascading dropdowns
-app.get('/api/filter-options', async (req, res) => {
-  try {
-    const rows = await db.query('SELECT region, province, city, merged_data FROM sites');
+app.get('/api/filter-options', (req, res) => {
+  db.all('SELECT region, province, city, merged_data FROM sites', [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    
     const options = rows.map(r => {
       let denominazione = '';
       let region = r.region;
@@ -395,8 +346,8 @@ app.get('/api/filter-options', async (req, res) => {
       let city = r.city;
 
       try {
-        const data = typeof r.merged_data === 'string' ? JSON.parse(r.merged_data || '{}') : r.merged_data;
-        denominazione = data.Denominazione || data.Nome || data.Descrizione || '';
+        const data = JSON.parse(r.merged_data || '{}');
+        denominazione = data.Denominazione || data.denominazione || data.Nome || data.Descrizione || '';
         
         // Fallback for region/province/city if they are empty in the root columns
         if (!region) region = data.Regione || data.Region || '';
@@ -413,29 +364,24 @@ app.get('/api/filter-options', async (req, res) => {
     });
     
     res.json(options);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  });
 });
 
 // API: Get single site
-app.get('/api/sites/:site_code', async (req, res) => {
-  try {
-    const rows = await db.query('SELECT * FROM sites WHERE site_code = ?', [req.params.site_code]);
-    if (rows.length === 0) return res.status(404).json({ error: 'Sito non trovato' });
+app.get('/api/sites/:site_code', (req, res) => {
+  db.get('SELECT * FROM sites WHERE site_code = ?', [req.params.site_code], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) return res.status(404).json({ error: 'Sito non trovato' });
     
-    const row = rows[0];
-    row.data_immobili = typeof row.data_immobili === 'string' ? JSON.parse(row.data_immobili) : row.data_immobili;
-    row.data_class_point = typeof row.data_class_point === 'string' ? JSON.parse(row.data_class_point) : row.data_class_point;
-    row.merged_data = typeof row.merged_data === 'string' ? JSON.parse(row.merged_data) : row.merged_data;
+    row.data_immobili = JSON.parse(row.data_immobili);
+    row.data_class_point = JSON.parse(row.data_class_point);
+    row.merged_data = JSON.parse(row.merged_data);
     res.json(row);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  });
 });
 
 // API: Create new site
-app.post('/api/sites', async (req, res) => {
+app.post('/api/sites', (req, res) => {
   const data = req.body;
   const site_code = data.site_code || data['CodiceImmobile'] || data['SAP Code'];
   
@@ -450,22 +396,20 @@ app.post('/api/sites', async (req, res) => {
   const lat = parseFloatSafe(data['Latitudine']);
   const lng = parseFloatSafe(data['Longitudine']);
 
-  try {
-    await db.run(`
-      INSERT INTO sites (site_code, region, province, city, status, latitude, longitude, data_immobili, data_class_point, merged_data)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      site_code, region, province, city, status, lat, lng, 
-      JSON.stringify(data), '{}', JSON.stringify(data)
-    ]);
+  db.run(`
+    INSERT INTO sites (site_code, region, province, city, status, latitude, longitude, data_immobili, data_class_point, merged_data)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [
+    site_code, region, province, city, status, lat, lng, 
+    JSON.stringify(data), '{}', JSON.stringify(data)
+  ], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
     res.status(201).json({ message: 'Sito creato', site_code });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  });
 });
 
 // API: Update or Insert site (Upsert)
-app.put('/api/sites/:site_code', async (req, res) => {
+app.put('/api/sites/:site_code', (req, res) => {
   const data = req.body;
   const site_code = req.params.site_code;
   
@@ -476,60 +420,61 @@ app.put('/api/sites/:site_code', async (req, res) => {
   const lat = parseFloatSafe(data['Latitudine']);
   const lng = parseFloatSafe(data['Longitudine']);
 
-  try {
-    // Prima controlliamo se esiste
-    const rows = await db.query('SELECT * FROM sites WHERE site_code = ?', [site_code]);
+  // Prima controlliamo se esiste
+  db.get('SELECT * FROM sites WHERE site_code = ?', [site_code], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
     
-    if (rows.length > 0) {
-      const row = rows[0];
+    if (row) {
       // Aggiornamento (merge dei dati esistenti con i nuovi)
-      const existingMergedData = typeof row.merged_data === 'string' ? JSON.parse(row.merged_data || '{}') : row.merged_data;
+      const existingMergedData = JSON.parse(row.merged_data || '{}');
       const newMergedData = { ...existingMergedData, ...data };
       
-      await db.run(`
+      db.run(`
         UPDATE sites 
         SET region=?, province=?, city=?, status=?, latitude=?, longitude=?, merged_data=?
         WHERE site_code=?
       `, [
         region, province, city, status, lat, lng, JSON.stringify(newMergedData), site_code
-      ]);
-      res.json({ message: 'Sito aggiornato' });
+      ], function(err) {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ message: 'Sito aggiornato' });
+      });
     } else {
       // Inserimento nuovo
-      await db.run(`
+      db.run(`
         INSERT INTO sites (site_code, region, province, city, status, latitude, longitude, data_immobili, data_class_point, merged_data)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         site_code, region, province, city, status, lat, lng, 
         JSON.stringify(data), '{}', JSON.stringify(data)
-      ]);
-      res.status(201).json({ message: 'Sito creato', site_code });
+      ], function(err) {
+        if (err) return res.status(500).json({ error: err.message });
+        res.status(201).json({ message: 'Sito creato', site_code });
+      });
     }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  });
 });
 
 // API: Delete site
-app.delete('/api/sites/:site_code', async (req, res) => {
-  try {
-    await db.run('DELETE FROM sites WHERE site_code=?', [req.params.site_code]);
+app.delete('/api/sites/:site_code', (req, res) => {
+  db.run('DELETE FROM sites WHERE site_code=?', [req.params.site_code], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
     res.json({ message: 'Sito eliminato' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  });
 });
 
 // API: Dashboard stats
-app.get('/api/stats', async (req, res) => {
-  try {
-    const stats = {};
-    stats.regions = await db.query('SELECT region, COUNT(*) as count FROM sites GROUP BY region');
-    stats.status = await db.query('SELECT status, COUNT(*) as count FROM sites GROUP BY status');
-    res.json(stats);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+app.get('/api/stats', (req, res) => {
+  const stats = {};
+  
+  db.all('SELECT region, COUNT(*) as count FROM sites GROUP BY region', [], (err, rows) => {
+    if (!err) stats.regions = rows;
+    
+    db.all('SELECT status, COUNT(*) as count FROM sites GROUP BY status', [], (err2, rows2) => {
+      if (!err2) stats.status = rows2;
+      res.json(stats);
+    });
+  });
 });
 
 app.listen(PORT, () => {
